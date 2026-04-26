@@ -5,6 +5,10 @@ import random
 import math
 
 TASKS_FILE = "tasks.txt"
+THROUGHPUT_FILE = "task_throughput.txt"
+THROUGHPUT_WINDOW_DAYS = 60
+LOW_THROUGHPUT_RATIO = 0.90
+LOW_THROUGHPUT_ABSOLUTE_LIMIT = 17
 
 
 class Task:
@@ -74,6 +78,152 @@ def filter_non_empty_days(day_lists):
     return {day: task_ids for day, task_ids in day_lists.items() if task_ids}
 
 
+def calculate_moving_average(days):
+    return sum(days) / len(days) if days else 0.0
+
+
+def normalize_throughput_data(data):
+    if not isinstance(data, dict):
+        data = {}
+
+    days = data.get("days", [])
+    if not isinstance(days, list):
+        days = []
+
+    normalized_days = []
+    for value in days[-THROUGHPUT_WINDOW_DAYS:]:
+        try:
+            normalized_days.append(max(0, int(value)))
+        except (TypeError, ValueError):
+            normalized_days.append(0)
+    if len(normalized_days) < THROUGHPUT_WINDOW_DAYS:
+        padding = [0] * (THROUGHPUT_WINDOW_DAYS - len(normalized_days))
+        normalized_days = padding + normalized_days
+
+    try:
+        current_day_weight_units = max(0, int(data.get("current_day_weight_units", 0)))
+    except (TypeError, ValueError):
+        current_day_weight_units = 0
+
+    enabled_value = data.get("enabled", True)
+    if isinstance(enabled_value, bool):
+        enabled = enabled_value
+    else:
+        enabled = str(enabled_value).strip().lower() != "false"
+
+    return {
+        "enabled": enabled,
+        "current_day_weight_units": current_day_weight_units,
+        "days": normalized_days,
+        "moving_average_weight_units": calculate_moving_average(normalized_days),
+    }
+
+
+def default_throughput_data():
+    return normalize_throughput_data({})
+
+
+def save_throughput_data(data):
+    normalized_data = normalize_throughput_data(data)
+    try:
+        with open(THROUGHPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(normalized_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving throughput data: {e}")
+    return normalized_data
+
+
+def load_throughput_data():
+    if not os.path.exists(THROUGHPUT_FILE):
+        return save_throughput_data(default_throughput_data())
+
+    try:
+        with open(THROUGHPUT_FILE, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception as e:
+        print(f"Error loading throughput data: {e}")
+        raw_data = default_throughput_data()
+
+    normalized_data = normalize_throughput_data(raw_data)
+    if normalized_data != raw_data:
+        save_throughput_data(normalized_data)
+    return normalized_data
+
+
+def is_throughput_tracking_enabled():
+    return load_throughput_data()["enabled"]
+
+
+def set_throughput_tracking_enabled(enabled):
+    data = load_throughput_data()
+    data["enabled"] = enabled
+    save_throughput_data(data)
+    if enabled:
+        print("Task throughput tracking enabled.")
+    else:
+        print("Task throughput tracking disabled.")
+
+
+def adjust_current_day_weight_units(delta):
+    data = load_throughput_data()
+    if not data["enabled"]:
+        return data
+    data["current_day_weight_units"] = max(0, data["current_day_weight_units"] + int(delta))
+    return save_throughput_data(data)
+
+
+def prompt_yes_no(prompt):
+    while True:
+        answer = input(prompt).strip().lower()
+        if answer in ("y", "n"):
+            return answer == "y"
+        print("Invalid input. Please enter y or n.")
+
+
+def parse_weight_update_input(raw_value):
+    text = raw_value.strip()
+    if not text:
+        raise ValueError
+
+    should_track = False
+    prefix = text[0].lower()
+    if prefix in ("y", "n"):
+        should_track = prefix == "y"
+        text = text[1:].strip()
+
+    if not text:
+        raise ValueError
+
+    return int(text), should_track
+
+
+def finish_day():
+    data = load_throughput_data()
+    if not data["enabled"]:
+        print("Task throughput tracking is disabled.")
+        return
+
+    completed_weight_units = data["current_day_weight_units"]
+    previous_average = calculate_moving_average(data["days"])
+    data["days"] = data["days"][1:] + [completed_weight_units]
+    data["current_day_weight_units"] = 0
+    data = save_throughput_data(data)
+
+    print(f"Finished day with {completed_weight_units} accomplished weight units.")
+    print(f"Previous 60-day average: {previous_average:.2f} weight units.")
+    print(f"New 60-day average: {data['moving_average_weight_units']:.2f} weight units.")
+
+    if (
+        previous_average > 0
+        and completed_weight_units <= previous_average * LOW_THROUGHPUT_RATIO
+        and completed_weight_units < LOW_THROUGHPUT_ABSOLUTE_LIMIT
+    ):
+        print(
+            "Warning: accomplished weight units are at least 10% below the "
+            "previous 60-day average and below 17."
+        )
+
+
 def save_tasks():
     data = [task.to_dict() for task in tasks.values()]
     try:
@@ -129,7 +279,13 @@ def remove_task():
     try:
         task_id = int(input("Enter task ID to remove: "))
         if task_id in tasks:
+            task = tasks[task_id]
+            should_track = False
+            if is_throughput_tracking_enabled():
+                should_track = prompt_yes_no("Should this deletion affect task weight tracking? (y/n): ")
             del tasks[task_id]
+            if should_track:
+                adjust_current_day_weight_units(task.weight)
             print(f"Task {task_id} removed.")
             save_tasks()
         else:
@@ -165,8 +321,16 @@ def update_task():
                     print("Invalid input. Keeping the current priority.")
             elif choice == "4":
                 try:
-                    new_weight = int(input("Enter new weight: "))
+                    old_weight = task.weight
+                    new_weight, should_track = parse_weight_update_input(
+                        input("Enter new weight: ")
+                    )
                     task.weight = new_weight
+                    if should_track:
+                        if is_throughput_tracking_enabled():
+                            adjust_current_day_weight_units(old_weight - new_weight)
+                        else:
+                            print("Task throughput tracking is disabled.")
                 except ValueError:
                     print("Invalid input. Keeping the current weight.")
             else:
@@ -266,13 +430,14 @@ def suggest_schedule():
         print(f"{idx}. {task}")
 
 
-def auto_plan(use_system_time=True):
+def auto_plan(use_system_time=True, planning_date_offset_days=0, today_provider=None):
     if not tasks:
         print("No tasks available.")
         return
 
     if use_system_time:
-        today = datetime.date.today()
+        base_today = today_provider() if today_provider is not None else datetime.date.today()
+        today = base_today + datetime.timedelta(days=planning_date_offset_days)
     else:
         while True:
             try:
@@ -284,7 +449,7 @@ def auto_plan(use_system_time=True):
             except ValueError:
                 print("Invalid date format or non-existent date. Please try again.")
 
-    print(f"Current date: {today}")
+    print(f"Planning date: {today}")
 
     tasks_with_w = [task for task in tasks.values() if task.weight > 0]
     tasks_zero = [task for task in tasks.values() if task.weight == 0]
@@ -406,10 +571,42 @@ def auto_plan(use_system_time=True):
     for task in sorted_tasks:
         print(task)
 
-    print("\nTo be done today:")
+    print("\nTo be done on planning date:")
     today_task_ids = sorted(set(day_lists.get(0, [])), key=today_section_sort_key)
     for task_id in today_task_ids:
         print(tasks[task_id])
+
+
+def print_main_menu():
+    tracking_enabled = is_throughput_tracking_enabled()
+    print("\nAuto-Planner Options:")
+    print("1. Add Task")
+    print("2. Remove Task")
+    print("3. Update Task")
+    print("4. List Tasks")
+    print("5. Generate Schedule")
+    print("6. Exit")
+    print("7. Show number of tasks with no deadlines")
+    print("8. Auto Plan")
+    if tracking_enabled:
+        print("9. Finish Day")
+    return tracking_enabled
+
+
+def run_auto_plan_prompt():
+    while True:
+        human_input = input("Use the system's time? (y/n): ").strip().lower()
+        if human_input == "y":
+            plan_tomorrow = prompt_yes_no("Plan for tomorrow instead of today? (y/n): ")
+            auto_plan(use_system_time=True, planning_date_offset_days=1 if plan_tomorrow else 0)
+            break
+        if human_input == "n":
+            auto_plan(use_system_time=False)
+            break
+        if human_input == "exit":
+            print("Canceling auto-plan.")
+            break
+        print("Invalid input. Please try again.")
 
 
 def main():
@@ -417,16 +614,8 @@ def main():
     load_tasks()
     while True:
         try:
-            print("\nTask Manager Options:")
-            print("1. Add Task")
-            print("2. Remove Task")
-            print("3. Update Task")
-            print("4. List Tasks")
-            print("5. Generate Schedule")
-            print("6. Exit")
-            print("7. Show number of tasks with no deadlines")
-            print("8. Auto Plan")
-            choice = input("Select an option: ")
+            tracking_enabled = print_main_menu()
+            choice = input("Select an option: ").strip().lower()
             if choice == "1":
                 add_task()
             elif choice == "2":
@@ -438,23 +627,21 @@ def main():
             elif choice == "5":
                 suggest_schedule()
             elif choice == "6":
-                print("Exiting Task Manager.")
+                print("Exiting Auto-Planner.")
                 break
             elif choice == "7":
                 print(count_tasks_without_deadline())
             elif choice == "8":
-                while True:
-                    human_input = input("Use the system's time? (y/n): ")
-                    if human_input in ("y", "n"):
-                        auto_plan(human_input == "y")
-                        break
-                    elif human_input == "exit":
-                        print("Canceling auto-plan.")
-                        break
-                    else:
-                        print("Invalid input. Please try again.")
+                run_auto_plan_prompt()
+            elif choice == "9" and tracking_enabled:
+                finish_day()
+            elif choice == "tt-off":
+                set_throughput_tracking_enabled(False)
+            elif choice == "tt-on":
+                set_throughput_tracking_enabled(True)
             else:
-                print("Invalid option. Please choose a number between 1 and 8.")
+                max_option = "9" if tracking_enabled else "8"
+                print(f"Invalid option. Please choose a number between 1 and {max_option}.")
         except Exception as e:
             print(f"An error occurred: {e}")
             # Continue the loop instead of crashing
